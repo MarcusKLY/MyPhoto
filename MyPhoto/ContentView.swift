@@ -26,6 +26,7 @@ struct ContentView: View {
     @State private var filterText: String = ""
     @State private var showOrganizeAlert = false
     @State private var cardFrames: [UUID: CGRect] = [:]
+    @State private var lastTapWasOnCard = false
     
     var gridColumns: [GridItem] {
         [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.5), spacing: 16)]
@@ -50,72 +51,19 @@ struct ContentView: View {
                     } else if photoManager.photoGroups.isEmpty {
                         ContentUnavailableView("No Photos", systemImage: "photo.on.rectangle")
                     } else {
-                        ScrollView {
-                            LazyVGrid(columns: gridColumns, spacing: 16) {
-                                ForEach(Array(filteredGroups.enumerated()), id: \.element.id) { index, group in
-                                    PhotoCardView(group: group, size: thumbnailSize)
-                                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selectedPhotoIDs.contains(group.id) ? Color.accentColor : Color.clear, lineWidth: 4))
-                                        .background(GeometryReader { geo in
-                                            Color.clear.onAppear {
-                                                cardFrames[group.id] = geo.frame(in: .global)
-                                            }
-                                        })
-                                        .highPriorityGesture(TapGesture(count: 1).onEnded {
-                                            let modifiers = NSApp.currentEvent?.modifierFlags ?? []
-                                            if modifiers.contains(.command) {
-                                                toggleSelection(for: group.id, at: index)
-                                            } else if modifiers.contains(.shift) && !selectedPhotoIDs.isEmpty {
-                                                extendSelection(to: group.id, at: index)
-                                            } else {
-                                                selectedPhotoIDs = [group.id]
-                                                lastSelectedIndex = index
-                                            }
-                                        })
-                                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                                            viewingPhoto = group
-                                            selectedPhotoIDs = [group.id]
-                                            lastSelectedIndex = index
-                                        })
-                                        .onDrag {
-                                            initiateDrag(from: [group], at: index)
-                                            return NSItemProvider(object: group.rawPreferredURL as NSURL)
-                                        }
-                                }
-                            }
-                            .padding()
-                        }
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            // Only deselect on tap - let card taps be handled by their own gestures first
-                            selectedPhotoIDs.removeAll()
-                        }
-                        .simultaneousGesture(DragGesture(minimumDistance: 8)
-                            .onChanged { value in
-                                if marqueeStart == nil {
-                                    marqueeStart = value.startLocation
-                                }
-                                marqueeEnd = value.location
-                                updateMarqueeSelection()
-                            }
-                            .onEnded { _ in
-                                marqueeStart = nil
-                            }
+                        PhotoGridView(
+                            selectedPhotoIDs: $selectedPhotoIDs,
+                            lastSelectedIndex: $lastSelectedIndex,
+                            lastTapWasOnCard: $lastTapWasOnCard,
+                            marqueeStart: $marqueeStart,
+                            marqueeEnd: $marqueeEnd,
+                            cardFrames: $cardFrames,
+                            viewingPhoto: $viewingPhoto,
+                            filteredGroups: filteredGroups,
+                            gridColumns: gridColumns,
+                            thumbnailSize: thumbnailSize,
+                            photoManager: photoManager
                         )
-                    }
-                    
-                    if let start = marqueeStart {
-                        let rect = CGRect(
-                            x: min(start.x, marqueeEnd.x),
-                            y: min(start.y, marqueeEnd.y),
-                            width: abs(marqueeEnd.x - start.x),
-                            height: abs(marqueeEnd.y - start.y)
-                        )
-                        
-                        Rectangle()
-                            .stroke(Color.accentColor, lineWidth: 2)
-                            .background(Color.accentColor.opacity(0.1))
-                            .frame(width: rect.width, height: rect.height)
-                            .position(x: rect.midX, y: rect.midY)
                     }
                 }
                 .frame(minWidth: 300, maxHeight: .infinity)
@@ -269,25 +217,6 @@ struct ContentView: View {
         }
     }
     
-    func updateMarqueeSelection() {
-        guard let start = marqueeStart else { return }
-        let marqueeRect = CGRect(
-            x: min(start.x, marqueeEnd.x),
-            y: min(start.y, marqueeEnd.y),
-            width: abs(marqueeEnd.x - start.x),
-            height: abs(marqueeEnd.y - start.y)
-        )
-        
-        // Select all cards whose frames intersect with the marquee rectangle
-        var newSelection: Set<UUID> = []
-        for group in filteredGroups {
-            if let cardFrame = cardFrames[group.id], marqueeRect.intersects(cardFrame) {
-                newSelection.insert(group.id)
-            }
-        }
-        selectedPhotoIDs = newSelection
-    }
-    
     func initiateDrag(from groups: [PhotoGroup], at index: Int) {
         let selectedGroups = groups.filter { selectedPhotoIDs.contains($0.id) }
         let dragGroups = selectedGroups.isEmpty ? groups : selectedGroups
@@ -310,15 +239,10 @@ struct ContentView: View {
     }
     
     func toggleSelection(for id: UUID, at index: Int) {
-        if selectedPhotoIDs.contains(id) { selectedPhotoIDs.remove(id) } else { selectedPhotoIDs = [id] }
-        lastSelectedIndex = index
-    }
-    
-    func extendSelection(to id: UUID, at index: Int) {
-        let fromIndex = min(lastSelectedIndex, index)
-        let toIndex = max(lastSelectedIndex, index)
-        for i in fromIndex...toIndex {
-            selectedPhotoIDs.insert(photoManager.photoGroups[i].id)
+        if selectedPhotoIDs.contains(id) {
+            selectedPhotoIDs.remove(id)
+        } else {
+            selectedPhotoIDs.insert(id)
         }
         lastSelectedIndex = index
     }
@@ -554,5 +478,145 @@ struct ShortcutGuideView: View {
         }
         .padding()
         .frame(width: 320)
+    }
+}
+
+struct PhotoGridView: View {
+    @Binding var selectedPhotoIDs: Set<UUID>
+    @Binding var lastSelectedIndex: Int
+    @Binding var lastTapWasOnCard: Bool
+    @Binding var marqueeStart: CGPoint?
+    @Binding var marqueeEnd: CGPoint
+    @Binding var cardFrames: [UUID: CGRect]
+    @Binding var viewingPhoto: PhotoGroup?
+    
+    let filteredGroups: [PhotoGroup]
+    let gridColumns: [GridItem]
+    let thumbnailSize: Double
+    let photoManager: PhotoManager
+    
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: gridColumns, spacing: 16) {
+                ForEach(Array(filteredGroups.enumerated()), id: \.element.id) { index, group in
+                    PhotoCardView(group: group, size: thumbnailSize)
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selectedPhotoIDs.contains(group.id) ? Color.accentColor : Color.clear, lineWidth: 4))
+                        .background(GeometryReader { geo in
+                            Color.clear.onAppear {
+                                cardFrames[group.id] = geo.frame(in: .local)
+                            }
+                        })
+                        .highPriorityGesture(TapGesture(count: 1).onEnded {
+                            lastTapWasOnCard = true
+                            let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+                            let isCmd = modifiers.contains(.command)
+                            let isShift = modifiers.contains(.shift)
+                            
+                            if isCmd {
+                                if selectedPhotoIDs.contains(group.id) {
+                                    selectedPhotoIDs.remove(group.id)
+                                } else {
+                                    selectedPhotoIDs.insert(group.id)
+                                }
+                            } else if isShift {
+                                extendSelection(to: group.id, at: index)
+                            } else {
+                                selectedPhotoIDs = [group.id]
+                            }
+                            lastSelectedIndex = index
+                        })
+                        .simultaneousGesture(TapGesture(count: 2).onEnded {
+                            viewingPhoto = group
+                            selectedPhotoIDs = [group.id]
+                            lastSelectedIndex = index
+                        })
+                        .onDrag {
+                            createDragProvider(for: group)
+                        }
+                }
+            }
+            .padding()
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if !lastTapWasOnCard {
+                selectedPhotoIDs.removeAll()
+            }
+            lastTapWasOnCard = false
+        }
+        .simultaneousGesture(DragGesture(minimumDistance: 8)
+            .onChanged { value in
+                if marqueeStart == nil {
+                    marqueeStart = value.startLocation
+                }
+                marqueeEnd = value.location
+                updateMarqueeSelection()
+            }
+            .onEnded { _ in
+                marqueeStart = nil
+            }
+        )
+        .overlay(alignment: .topLeading) {
+            if let start = marqueeStart {
+                let rect = CGRect(
+                    x: min(start.x, marqueeEnd.x),
+                    y: min(start.y, marqueeEnd.y),
+                    width: abs(marqueeEnd.x - start.x),
+                    height: abs(marqueeEnd.y - start.y)
+                )
+                
+                Rectangle()
+                    .stroke(Color.accentColor, lineWidth: 2)
+                    .background(Color.accentColor.opacity(0.1))
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+            }
+        }
+    }
+    
+    func updateMarqueeSelection() {
+        guard let start = marqueeStart else { return }
+        let marqueeRect = CGRect(
+            x: min(start.x, marqueeEnd.x),
+            y: min(start.y, marqueeEnd.y),
+            width: abs(marqueeEnd.x - start.x),
+            height: abs(marqueeEnd.y - start.y)
+        )
+        
+        var newSelection: Set<UUID> = []
+        for group in filteredGroups {
+            if let cardFrame = cardFrames[group.id], marqueeRect.intersects(cardFrame) {
+                newSelection.insert(group.id)
+            }
+        }
+        selectedPhotoIDs = newSelection
+    }
+    
+    func createDragProvider(for group: PhotoGroup) -> NSItemProvider {
+        let dragGroups: [PhotoGroup]
+        if selectedPhotoIDs.contains(group.id) {
+            dragGroups = photoManager.photoGroups.filter { selectedPhotoIDs.contains($0.id) }
+        } else {
+            dragGroups = [group]
+        }
+        
+        let urls = dragGroups.map { $0.rawPreferredURL }
+        return NSItemProvider(object: urls.first as NSURL? ?? NSURL())
+    }
+    
+    func extendSelection(to photoID: UUID, at index: Int) {
+        guard let lastIndex = lastSelectedIndex as Int? else {
+            selectedPhotoIDs.insert(photoID)
+            return
+        }
+        
+        let startIndex = min(lastIndex, index)
+        let endIndex = max(lastIndex, index)
+        
+        for i in startIndex...endIndex {
+            if i >= 0 && i < filteredGroups.count {
+                selectedPhotoIDs.insert(filteredGroups[i].id)
+            }
+        }
     }
 }
