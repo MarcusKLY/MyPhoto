@@ -3,7 +3,6 @@ import CoreGraphics
 import ImageIO
 import AppKit
 import SwiftUI
-import CoreImage
 import QuickLookThumbnailing // NEW: Apple's native Finder thumbnail engine
 
 @Observable
@@ -81,7 +80,7 @@ class PhotoManager {
         var sortedGroups = groupedMap.values.sorted { $0.baseName < $1.baseName }
         
         // --- NEW: HIGH-SPEED CONCURRENT QUICKLOOK EXTRACTION ---
-        await withTaskGroup(of: (Int, CGImage?, Double?).self) { groupTask in
+        await withTaskGroup(of: (Int, CGImage?).self) { groupTask in
             for i in 0..<sortedGroups.count {
                 let group = sortedGroups[i]
                 
@@ -91,16 +90,14 @@ class PhotoManager {
                 if let url = targetURL {
                     groupTask.addTask {
                         let thumb = await self.extractThumbnail(for: url)
-                        let score = thumb.flatMap { self.computeFocusScore(for: $0) }
-                        return (i, thumb, score)
+                        return (i, thumb)
                     }
                 }
             }
             
             // Collect the extracted thumbnails as they finish
-            for await (index, thumbnail, score) in groupTask {
+            for await (index, thumbnail) in groupTask {
                 sortedGroups[index].thumbnail = thumbnail
-                sortedGroups[index].focusScore = score
             }
         }
         
@@ -128,40 +125,6 @@ class PhotoManager {
                   let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
             return cgImage
         }
-    }
-    
-    nonisolated private func computeFocusScore(for image: CGImage) -> Double? {
-        let context = CIContext(options: nil)
-        let ciImage = CIImage(cgImage: image)
-        guard let edgeFilter = CIFilter(name: "CIEdges"),
-              let avgFilter = CIFilter(name: "CIAreaAverage") else {
-            return nil
-        }
-        
-        edgeFilter.setValue(ciImage, forKey: kCIInputImageKey)
-        edgeFilter.setValue(2.0, forKey: kCIInputIntensityKey)
-        guard let edgedImage = edgeFilter.outputImage else {
-            return nil
-        }
-        
-        let extent = edgedImage.extent
-        avgFilter.setValue(edgedImage, forKey: kCIInputImageKey)
-        avgFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
-        guard let output = avgFilter.outputImage else {
-            return nil
-        }
-        
-        var pixel = [UInt8](repeating: 0, count: 4)
-        context.render(
-            output,
-            toBitmap: &pixel,
-            rowBytes: 4,
-            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-            format: .RGBA8,
-            colorSpace: CGColorSpaceCreateDeviceRGB()
-        )
-        let average = (Double(pixel[0]) + Double(pixel[1]) + Double(pixel[2])) / (3.0 * 255.0)
-        return average
     }
     
     nonisolated func getMetadata(for group: PhotoGroup) -> [String: String] {

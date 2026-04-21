@@ -79,18 +79,23 @@ struct ContentView: View {
                             .padding()
                         }
                         .contentShape(Rectangle())
-                        .onTapGesture {
-                            selectedPhotoIDs.removeAll()
-                        }
-                        .simultaneousGesture(DragGesture(minimumDistance: 8)
+                        .simultaneousGesture(DragGesture(minimumDistance: 0)
                             .onChanged { value in
-                                if marqueeStart == nil {
+                                // For marquee: if drag distance > 8, it's a marquee drag
+                                if marqueeStart == nil && hypot(value.translation.width, value.translation.height) >= 8 {
                                     marqueeStart = value.startLocation
                                 }
-                                marqueeEnd = value.location
-                                updateMarqueeSelection()
+                                if marqueeStart != nil {
+                                    marqueeEnd = value.location
+                                    updateMarqueeSelection()
+                                }
                             }
-                            .onEnded { _ in
+                            .onEnded { value in
+                                // For deselect: only if drag distance < 4 (basically a click) in empty area
+                                let distance = hypot(value.translation.width, value.translation.height)
+                                if distance < 4 && marqueeStart == nil {
+                                    selectedPhotoIDs.removeAll()
+                                }
                                 marqueeStart = nil
                             }
                         )
@@ -249,15 +254,14 @@ struct ContentView: View {
         
         // Keyboard Setup
         .focusable()
-        .onKeyPress(keys: [.leftArrow, .rightArrow, .escape, "x", "X", "k", "K", "u", "U", "z", "Z"] as Set<KeyEquivalent>) { press in
+        .onKeyPress(keys: [.leftArrow, .rightArrow, .escape, "x", "X", "z", "Z", "c", "C"] as Set<KeyEquivalent>) { press in
             switch press.key {
             case .leftArrow: moveSelection(offset: -1, extending: press.modifiers.contains(.shift)); return .handled
             case .rightArrow: moveSelection(offset: 1, extending: press.modifiers.contains(.shift)); return .handled
             case .escape: selectedPhotoIDs.removeAll(); return .handled
-            case "x", "X": photoManager.flagSelected(ids: selectedPhotoIDs, keep: false); return .handled
-            case "k", "K": photoManager.flagSelected(ids: selectedPhotoIDs, keep: true); return .handled
-            case "u", "U": photoManager.unflagSelected(ids: selectedPhotoIDs); return .handled
-            case "z", "Z": photoManager.toggleFlagSelected(ids: selectedPhotoIDs); return .handled
+            case "z", "Z": photoManager.flagSelected(ids: selectedPhotoIDs, keep: false); return .handled
+            case "x", "X": photoManager.flagSelected(ids: selectedPhotoIDs, keep: true); return .handled
+            case "c", "C": photoManager.unflagSelected(ids: selectedPhotoIDs); return .handled
             default: return .ignored
             }
         }
@@ -405,9 +409,6 @@ struct LiveZoomableView: View {
                     Text(group.baseName).font(.system(size: 14, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Material.ultraThin).cornerRadius(8).shadow(radius: 2)
                     if group.isKept { Text("KEEP").font(.system(size: 12, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Color.green.opacity(0.8)).cornerRadius(8) }
                     if group.isRejected { Text("REJECT").font(.system(size: 12, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Color.red.opacity(0.8)).cornerRadius(8) }
-                    if let score = group.focusScore {
-                        Text("FOCUS: \(String(format: "%.1f", score * 100))").font(.system(size: 12, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Color.blue.opacity(0.8)).cornerRadius(8)
-                    }
                     Spacer()
                 }
                 .padding(.top, 24).padding(.leading, 24)
@@ -489,22 +490,10 @@ struct PhotoCardView: View {
     
     var body: some View {
         VStack(spacing: 8) {
-            ZStack(alignment: .topTrailing) {
-                if let cgImage = group.thumbnail {
-                    Image(decorative: cgImage, scale: 1.0).resizable().scaledToFit().frame(height: size * 0.75).cornerRadius(8)
-                } else {
-                    Rectangle().fill(Color.gray.opacity(0.3)).frame(height: size * 0.75)
-                }
-                
-                if let score = group.focusScore {
-                    Text("📍 \(String(format: "%.0f", score * 100))")
-                        .font(.system(size: 10, weight: .bold))
-                        .padding(4)
-                        .background(Color.black.opacity(0.7))
-                        .foregroundColor(.white)
-                        .cornerRadius(4)
-                        .padding(4)
-                }
+            if let cgImage = group.thumbnail {
+                Image(decorative: cgImage, scale: 1.0).resizable().scaledToFit().frame(height: size * 0.75).cornerRadius(8)
+            } else {
+                Rectangle().fill(Color.gray.opacity(0.3)).frame(height: size * 0.75)
             }
             
             HStack {
@@ -539,10 +528,9 @@ struct ShortcutGuideView: View {
             HStack { Text("Shift + Arrows").bold(); Spacer(); Text("Multi-Select") }
             HStack { Text("Cmd + Click").bold(); Spacer(); Text("Toggle Item") }
             HStack { Text("Shift + Click").bold(); Spacer(); Text("Select Range") }
-            HStack { Text("X").bold(); Spacer(); Text("Reject") }
-            HStack { Text("K").bold(); Spacer(); Text("Keep") }
-            HStack { Text("U").bold(); Spacer(); Text("Unflag") }
-            HStack { Text("Z").bold(); Spacer(); Text("Toggle Flag") }
+            HStack { Text("Z").bold(); Spacer(); Text("Reject") }
+            HStack { Text("X").bold(); Spacer(); Text("Keep") }
+            HStack { Text("C").bold(); Spacer(); Text("Unflag") }
             HStack { Text("ESC").bold(); Spacer(); Text("Deselect All") }
         }
         .padding()
