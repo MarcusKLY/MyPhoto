@@ -1,6 +1,13 @@
 import SwiftUI
 import AppKit
 
+enum FlagFilter: String, CaseIterable {
+    case all = "All"
+    case kept = "Kept"
+    case rejected = "Rejected"
+    case unflagged = "Unflagged"
+}
+
 struct ContentView: View {
     @State private var photoManager = PhotoManager()
     @State private var thumbnailSize: Double = 300
@@ -24,6 +31,7 @@ struct ContentView: View {
     @State private var marqueeEnd: CGPoint = .zero
     @State private var isDraggingCoordinator: FileDragSourceCoordinator?
     @State private var filterText: String = ""
+    @State private var flagFilter: FlagFilter = .all
     @State private var showOrganizeAlert = false
     @State private var cardFrames: [UUID: CGRect] = [:]
     @State private var lastTapWasOnCard = false
@@ -33,9 +41,21 @@ struct ContentView: View {
     }
     
     var filteredGroups: [PhotoGroup] {
-        guard !filterText.isEmpty else { return photoManager.photoGroups }
-        return photoManager.photoGroups.filter { group in
-            group.baseName.lowercased().contains(filterText.lowercased())
+        var groups = photoManager.photoGroups
+        
+        // 1. Text Filter
+        if !filterText.isEmpty {
+            groups = groups.filter { group in
+                group.baseName.lowercased().contains(filterText.lowercased())
+            }
+        }
+        
+        // 2. Flag Filter
+        switch flagFilter {
+        case .all: return groups
+        case .kept: return groups.filter { $0.isKept }
+        case .rejected: return groups.filter { $0.isRejected }
+        case .unflagged: return groups.filter { !$0.isKept && !$0.isRejected }
         }
     }
     
@@ -109,6 +129,18 @@ struct ContentView: View {
                             Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                         }
                     }
+                    
+                    Divider().frame(height: 16).padding(.horizontal, 4)
+                    
+                    // NEW: Flag Filter UI
+                    Picker("Flag Filter", selection: $flagFilter) {
+                        Text("All").tag(FlagFilter.all)
+                        Text("Kept").tag(FlagFilter.kept)
+                        Text("Rejected").tag(FlagFilter.rejected)
+                        Text("Unflagged").tag(FlagFilter.unflagged)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 300)
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 8)
@@ -497,58 +529,116 @@ struct PhotoGridView: View {
     
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: gridColumns, spacing: 16) {
-                ForEach(Array(filteredGroups.enumerated()), id: \.element.id) { index, group in
-                    PhotoCardView(group: group, size: thumbnailSize)
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selectedPhotoIDs.contains(group.id) ? Color.accentColor : Color.clear, lineWidth: 4))
-                        .background(GeometryReader { geo in
-                            Color.clear.onAppear {
-                                cardFrames[group.id] = geo.frame(in: .local)
-                            }
-                        })
-                        .highPriorityGesture(TapGesture(count: 1).onEnded {
-                            lastTapWasOnCard = true
-                            let modifiers = NSApp.currentEvent?.modifierFlags ?? []
-                            let isCmd = modifiers.contains(.command)
-                            let isShift = modifiers.contains(.shift)
-                            
-                            if isCmd {
-                                if selectedPhotoIDs.contains(group.id) {
-                                    selectedPhotoIDs.remove(group.id)
-                                } else {
-                                    selectedPhotoIDs.insert(group.id)
-                                }
-                            } else if isShift {
-                                extendSelection(to: group.id, at: index)
-                            } else {
+            // FIX 1: ZStack placed inside the ScrollView so the overlay scrolls naturally
+            ZStack(alignment: .topLeading) {
+                LazyVGrid(columns: gridColumns, spacing: 16) {
+                    ForEach(Array(filteredGroups.enumerated()), id: \.element.id) { index, group in
+                        PhotoCardView(group: group, size: thumbnailSize)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(selectedPhotoIDs.contains(group.id) ? Color.accentColor : Color.clear, lineWidth: 4)
+                            )
+                            .background(GeometryReader { geo in
+                                Color.clear
+                                    .onAppear {
+                                        cardFrames[group.id] = geo.frame(in: .named("GridSpace"))
+                                    }
+                                    .onChange(of: geo.frame(in: .named("GridSpace"))) { _, newFrame in
+                                        cardFrames[group.id] = newFrame 
+                                    }
+                            })
+                            .onTapGesture(count: 2) {
+                                viewingPhoto = group
                                 selectedPhotoIDs = [group.id]
+                                lastSelectedIndex = index
                             }
-                            lastSelectedIndex = index
-                        })
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            viewingPhoto = group
-                            selectedPhotoIDs = [group.id]
-                            lastSelectedIndex = index
-                        })
-                        .onDrag {
-                            createDragProvider(for: group)
-                        }
+                            .highPriorityGesture(TapGesture(count: 1).onEnded {
+                                let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+                                let isCmd = modifiers.contains(.command)
+                                let isShift = modifiers.contains(.shift)
+                                
+                                if isCmd {
+                                    if selectedPhotoIDs.contains(group.id) {
+                                        selectedPhotoIDs.remove(group.id)
+                                    } else {
+                                        selectedPhotoIDs.insert(group.id)
+                                    }
+                                } else if isShift {
+                                    extendSelection(to: group.id, at: index)
+                                } else {
+                                    selectedPhotoIDs = [group.id]
+                                }
+                                lastSelectedIndex = index
+                            })
+                            .onDrag {
+                                let dragGroups: [PhotoGroup]
+                                
+                                // 1. Check if the dragged item is part of the current selection.
+                                if selectedPhotoIDs.contains(group.id) {
+                                    // Dragging an already selected item pulls the whole selection
+                                    dragGroups = photoManager.photoGroups.filter { selectedPhotoIDs.contains($0.id) }
+                                } else {
+                                    // Dragging an UNSELECTED item should immediately select it
+                                    dragGroups = [group]
+                                    DispatchQueue.main.async {
+                                        selectedPhotoIDs = [group.id]
+                                    }
+                                }
+                                
+                                // 2. Return the first item so SwiftUI can create the visual drag "ghost" under your cursor
+                                let provider = NSItemProvider(object: dragGroups.first!.rawPreferredURL as NSURL)
+                                
+                                // 3. ✨ THE MAGIC HACK: Hijack the dedicated macOS Drag Pasteboard
+                                // We wait 0.05 seconds so SwiftUI finishes creating the drag session,
+                                // then we overwrite the drag clipboard with ALL selected files.
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                    let dragPasteboard = NSPasteboard(name: .drag)
+                                    dragPasteboard.clearContents()
+                                    
+                                    let urls = dragGroups.map { $0.rawPreferredURL as NSURL }
+                                    dragPasteboard.writeObjects(urls)
+                                }
+                                
+                                return provider
+                            }
+                    }
+                }
+                .padding()
+                .frame(maxWidth: .infinity, minHeight: 800, alignment: .top)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    selectedPhotoIDs.removeAll()
+                }
+                
+                // FIX 2: Marquee visual moved here
+                if let start = marqueeStart {
+                    let rect = CGRect(
+                        x: min(start.x, marqueeEnd.x),
+                        y: min(start.y, marqueeEnd.y),
+                        width: abs(marqueeEnd.x - start.x),
+                        height: abs(marqueeEnd.y - start.y)
+                    )
+                    
+                    Rectangle()
+                        .stroke(Color.accentColor, lineWidth: 2)
+                        .background(Color.accentColor.opacity(0.1))
+                        .frame(width: rect.width, height: rect.height)
+                        .offset(x: rect.minX, y: rect.minY) 
                 }
             }
-            .padding()
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if !lastTapWasOnCard {
-                selectedPhotoIDs.removeAll()
-            }
-            lastTapWasOnCard = false
-        }
-        .simultaneousGesture(DragGesture(minimumDistance: 8)
+        .coordinateSpace(name: "GridSpace")
+        .simultaneousGesture(DragGesture(minimumDistance: 8, coordinateSpace: .named("GridSpace"))
             .onChanged { value in
                 if marqueeStart == nil {
+                    // FIX 3: If the drag starts ON a photo, completely abort the marquee
+                    // This stops the marquee from resetting your selection during drag-and-drop
+                    let isHit = cardFrames.values.contains { $0.contains(value.startLocation) }
+                    if isHit { return }
                     marqueeStart = value.startLocation
                 }
+                
+                guard marqueeStart != nil else { return } // Keep skipping if we aborted
                 marqueeEnd = value.location
                 updateMarqueeSelection()
             }
@@ -556,22 +646,6 @@ struct PhotoGridView: View {
                 marqueeStart = nil
             }
         )
-        .overlay(alignment: .topLeading) {
-            if let start = marqueeStart {
-                let rect = CGRect(
-                    x: min(start.x, marqueeEnd.x),
-                    y: min(start.y, marqueeEnd.y),
-                    width: abs(marqueeEnd.x - start.x),
-                    height: abs(marqueeEnd.y - start.y)
-                )
-                
-                Rectangle()
-                    .stroke(Color.accentColor, lineWidth: 2)
-                    .background(Color.accentColor.opacity(0.1))
-                    .frame(width: rect.width, height: rect.height)
-                    .position(x: rect.midX, y: rect.midY)
-            }
-        }
     }
     
     func updateMarqueeSelection() {
@@ -592,24 +666,8 @@ struct PhotoGridView: View {
         selectedPhotoIDs = newSelection
     }
     
-    func createDragProvider(for group: PhotoGroup) -> NSItemProvider {
-        let dragGroups: [PhotoGroup]
-        if selectedPhotoIDs.contains(group.id) {
-            dragGroups = photoManager.photoGroups.filter { selectedPhotoIDs.contains($0.id) }
-        } else {
-            dragGroups = [group]
-        }
-        
-        let urls = dragGroups.map { $0.rawPreferredURL }
-        return NSItemProvider(object: urls.first as NSURL? ?? NSURL())
-    }
-    
     func extendSelection(to photoID: UUID, at index: Int) {
-        guard let lastIndex = lastSelectedIndex as Int? else {
-            selectedPhotoIDs.insert(photoID)
-            return
-        }
-        
+        let lastIndex = lastSelectedIndex
         let startIndex = min(lastIndex, index)
         let endIndex = max(lastIndex, index)
         
