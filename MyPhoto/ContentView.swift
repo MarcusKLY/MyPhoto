@@ -181,10 +181,31 @@ struct ContentView: View {
                                     .foregroundColor(.orange)
                             }
                             .help("RAW Organization Issues")
-                            .alert("Organization Issues", isPresented: $showOrganizeAlert) {
-                                Button("OK") { }
-                            } message: {
-                                Text(photoManager.rawOrganizationIssues.joined(separator: "\n"))
+                            .popover(isPresented: $showOrganizeAlert) {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Text("Organization Issues").font(.headline).bold()
+                                    Divider()
+                                    ScrollView {
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            ForEach(photoManager.rawOrganizationIssues, id: \.self) { issue in
+                                                HStack(alignment: .top, spacing: 8) {
+                                                    Image(systemName: "exclamationmark.triangle.fill")
+                                                        .foregroundColor(.orange)
+                                                        .frame(width: 20)
+                                                    Text(issue).font(.caption)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    .frame(height: 200)
+                                    HStack {
+                                        Spacer()
+                                        Button("Close") { showOrganizeAlert = false }
+                                            .keyboardShortcut(.defaultAction)
+                                    }
+                                }
+                                .padding()
+                                .frame(width: 350)
                             }
                         }
                         
