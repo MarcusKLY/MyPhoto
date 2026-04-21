@@ -10,8 +10,6 @@ import SwiftUI
 @main
 struct MyPhotoApp: App {
     var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
+        WindowGroup(content: ContentView.init)
     }
 }

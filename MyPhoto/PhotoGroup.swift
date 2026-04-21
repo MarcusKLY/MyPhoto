@@ -12,6 +12,7 @@ struct PhotoGroup: Identifiable, Sendable {
     var pngURL: URL?
     
     var thumbnail: CGImage?
+    var focusScore: Double?
     
     var isRejected: Bool = false
     var isKept: Bool = false

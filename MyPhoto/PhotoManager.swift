@@ -3,6 +3,7 @@ import CoreGraphics
 import ImageIO
 import AppKit
 import SwiftUI
+import CoreImage
 import QuickLookThumbnailing // NEW: Apple's native Finder thumbnail engine
 
 @Observable
@@ -67,7 +68,7 @@ class PhotoManager {
         var sortedGroups = groupedMap.values.sorted { $0.baseName < $1.baseName }
         
         // --- NEW: HIGH-SPEED CONCURRENT QUICKLOOK EXTRACTION ---
-        await withTaskGroup(of: (Int, CGImage?).self) { groupTask in
+        await withTaskGroup(of: (Int, CGImage?, Double?).self) { groupTask in
             for i in 0..<sortedGroups.count {
                 let group = sortedGroups[i]
                 
@@ -77,14 +78,16 @@ class PhotoManager {
                 if let url = targetURL {
                     groupTask.addTask {
                         let thumb = await self.extractThumbnail(for: url)
-                        return (i, thumb)
+                        let score = thumb.flatMap { self.computeFocusScore(for: $0) }
+                        return (i, thumb, score)
                     }
                 }
             }
             
             // Collect the extracted thumbnails as they finish
-            for await (index, thumbnail) in groupTask {
+            for await (index, thumbnail, score) in groupTask {
                 sortedGroups[index].thumbnail = thumbnail
+                sortedGroups[index].focusScore = score
             }
         }
         
@@ -112,6 +115,40 @@ class PhotoManager {
                   let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
             return cgImage
         }
+    }
+    
+    nonisolated private func computeFocusScore(for image: CGImage) -> Double? {
+        let context = CIContext(options: nil)
+        let ciImage = CIImage(cgImage: image)
+        guard let edgeFilter = CIFilter(name: "CIEdges"),
+              let avgFilter = CIFilter(name: "CIAreaAverage") else {
+            return nil
+        }
+        
+        edgeFilter.setValue(ciImage, forKey: kCIInputImageKey)
+        edgeFilter.setValue(2.0, forKey: kCIInputIntensityKey)
+        guard let edgedImage = edgeFilter.outputImage else {
+            return nil
+        }
+        
+        let extent = edgedImage.extent
+        avgFilter.setValue(edgedImage, forKey: kCIInputImageKey)
+        avgFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
+        guard let output = avgFilter.outputImage else {
+            return nil
+        }
+        
+        var pixel = [UInt8](repeating: 0, count: 4)
+        context.render(
+            output,
+            toBitmap: &pixel,
+            rowBytes: 4,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
+        let average = (Double(pixel[0]) + Double(pixel[1]) + Double(pixel[2])) / (3.0 * 255.0)
+        return average
     }
     
     nonisolated func getMetadata(for group: PhotoGroup) -> [String: String] {
@@ -195,6 +232,99 @@ class PhotoManager {
             guard let index = photoGroups.firstIndex(where: { $0.id == id }) else { continue }
             photoGroups[index].isKept = false; photoGroups[index].isRejected = false
         }
+    }
+    
+    @MainActor func toggleFlagSelected(ids: Set<UUID>) {
+        for id in ids {
+            guard let index = photoGroups.firstIndex(where: { $0.id == id }) else { continue }
+            if photoGroups[index].isKept { photoGroups[index].isKept = false }
+            else if photoGroups[index].isRejected { photoGroups[index].isRejected = false }
+            else { photoGroups[index].isKept = true }
+        }
+    }
+    
+    var hasRawFiles: Bool {
+        photoGroups.contains { $0.arwURL != nil || $0.rafURL != nil }
+    }
+    
+    var rawOrganizationIssues: [String] {
+        var issues: [String] = []
+        for group in photoGroups {
+            let raws = [group.arwURL, group.rafURL].compactMap { $0 }
+            let hasPreview = group.heifURL != nil || group.jpgURL != nil || group.pngURL != nil
+            if hasPreview && raws.isEmpty {
+                issues.append("Missing RAW pair for \(group.baseName)")
+            }
+        }
+        return issues
+    }
+    
+    var hasRawOrganizationIssues: Bool {
+        !rawOrganizationIssues.isEmpty
+    }
+    
+    var canOrganizeRaws: Bool {
+        !rawFilesOutsideExpectedFolders().isEmpty
+    }
+    
+    @MainActor
+    func organizeRawFilesByExtension() {
+        guard !photoGroups.isEmpty else { return }
+        let fileManager = FileManager.default
+        var movedCount = 0
+        
+        for group in photoGroups {
+            for rawURL in [group.arwURL, group.rafURL].compactMap({ $0 }) {
+                let source = rawURL.standardizedFileURL
+                let ext = source.pathExtension.lowercased()
+                guard ["arw", "raf"].contains(ext) else { continue }
+                
+                let root = source.deletingLastPathComponent().deletingLastPathComponent()
+                let folderName = ext.uppercased()
+                let targetDirectory = root.appendingPathComponent(folderName, isDirectory: true)
+                
+                do {
+                    try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true, attributes: nil)
+                } catch {
+                    print("Failed to create folder: \(error.localizedDescription)")
+                    continue
+                }
+                
+                let destination = targetDirectory.appendingPathComponent(source.lastPathComponent)
+                guard destination.path != source.path else { continue }
+                
+                do {
+                    try fileManager.moveItem(at: source, to: destination)
+                    movedCount += 1
+                } catch {
+                    print("Failed to move file: \(error.localizedDescription)")
+                }
+            }
+        }
+        
+        if movedCount > 0 {
+            if let first = photoGroups.first, let url = first.arwURL?.deletingLastPathComponent().deletingLastPathComponent() {
+                scanDirectory(at: url)
+            }
+        }
+    }
+    
+    private func rawFilesOutsideExpectedFolders() -> [URL] {
+        var rawsOutside: [URL] = []
+        for group in photoGroups {
+            for rawURL in [group.arwURL, group.rafURL].compactMap({ $0 }) {
+                let source = rawURL.standardizedFileURL
+                let ext = source.pathExtension.lowercased()
+                guard ["arw", "raf"].contains(ext) else { continue }
+                
+                let folderName = ext.uppercased()
+                let parentPath = source.deletingLastPathComponent().lastPathComponent
+                if parentPath.uppercased() != folderName {
+                    rawsOutside.append(rawURL)
+                }
+            }
+        }
+        return rawsOutside
     }
     
     @MainActor func trashGroup(withID id: UUID) {

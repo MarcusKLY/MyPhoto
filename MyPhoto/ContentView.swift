@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @State private var photoManager = PhotoManager()
@@ -19,8 +20,21 @@ struct ContentView: View {
     @State private var showAdvancedEXIF = false
     @State private var showGPS = true
     
+    @State private var marqueeStart: CGPoint?
+    @State private var marqueeEnd: CGPoint = .zero
+    @State private var isDraggingCoordinator: FileDragSourceCoordinator?
+    @State private var filterText: String = ""
+    @State private var showOrganizeAlert = false
+    
     var gridColumns: [GridItem] {
         [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.5), spacing: 16)]
+    }
+    
+    var filteredGroups: [PhotoGroup] {
+        guard !filterText.isEmpty else { return photoManager.photoGroups }
+        return photoManager.photoGroups.filter { group in
+            group.baseName.lowercased().contains(filterText.lowercased())
+        }
     }
     
     var body: some View {
@@ -28,7 +42,7 @@ struct ContentView: View {
             HSplitView {
                 // Left Side: Grid
                 ZStack {
-                    Color.clear.contentShape(Rectangle()).onTapGesture { selectedPhotoIDs.removeAll() }
+                    Color.clear
                     
                     if photoManager.isScanning {
                         ContentUnavailableView("Scanning", systemImage: "magnifyingglass")
@@ -37,23 +51,64 @@ struct ContentView: View {
                     } else {
                         ScrollView {
                             LazyVGrid(columns: gridColumns, spacing: 16) {
-                                ForEach(Array(photoManager.photoGroups.enumerated()), id: \.element.id) { index, group in
+                                ForEach(Array(filteredGroups.enumerated()), id: \.element.id) { index, group in
                                     PhotoCardView(group: group, size: thumbnailSize)
                                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selectedPhotoIDs.contains(group.id) ? Color.accentColor : Color.clear, lineWidth: 4))
                                         .highPriorityGesture(TapGesture(count: 1).onEnded {
-                                            toggleSelection(for: group.id, at: index)
+                                            let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+                                            if modifiers.contains(.command) {
+                                                toggleSelection(for: group.id, at: index)
+                                            } else if modifiers.contains(.shift) && !selectedPhotoIDs.isEmpty {
+                                                extendSelection(to: group.id, at: index)
+                                            } else {
+                                                selectedPhotoIDs = [group.id]
+                                                lastSelectedIndex = index
+                                            }
                                         })
                                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                                             viewingPhoto = group
                                             selectedPhotoIDs = [group.id]
                                             lastSelectedIndex = index
                                         })
-                                        // NATIVE LIGHTROOM INTEGRATION: Click and drag!
-                                        .draggable(group.rawPreferredURL)
+                                        .onDrag {
+                                            initiateDrag(from: [group], at: index)
+                                            return NSItemProvider(object: group.rawPreferredURL as NSURL)
+                                        }
                                 }
                             }
                             .padding()
                         }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            selectedPhotoIDs.removeAll()
+                        }
+                        .simultaneousGesture(DragGesture(minimumDistance: 8)
+                            .onChanged { value in
+                                if marqueeStart == nil {
+                                    marqueeStart = value.startLocation
+                                }
+                                marqueeEnd = value.location
+                                updateMarqueeSelection()
+                            }
+                            .onEnded { _ in
+                                marqueeStart = nil
+                            }
+                        )
+                    }
+                    
+                    if let start = marqueeStart {
+                        let rect = CGRect(
+                            x: min(start.x, marqueeEnd.x),
+                            y: min(start.y, marqueeEnd.y),
+                            width: abs(marqueeEnd.x - start.x),
+                            height: abs(marqueeEnd.y - start.y)
+                        )
+                        
+                        Rectangle()
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .background(Color.accentColor.opacity(0.1))
+                            .frame(width: rect.width, height: rect.height)
+                            .position(x: rect.midX, y: rect.midY)
                     }
                 }
                 .frame(minWidth: 300, maxHeight: .infinity)
@@ -88,28 +143,71 @@ struct ContentView: View {
             Divider()
             
             // Bottom Toolbar
-            HStack(spacing: 20) {
-                Image(systemName: "photo").foregroundStyle(.secondary)
-                Slider(value: $thumbnailSize, in: 100...800).frame(width: 150)
-                Spacer()
-                
-                if !selectedPhotoIDs.isEmpty {
-                    Text("\(selectedPhotoIDs.count) Selected").foregroundStyle(.secondary)
-                    Button(role: .destructive) { deleteSelectedPhotos() } label: { Label("Trash", systemImage: "trash") }.keyboardShortcut(.delete, modifiers: [])
-                }
-                
-                Divider().frame(height: 20)
-                Button { isSplitView.toggle() } label: { Image(systemName: isSplitView ? "rectangle.split.2x1.fill" : "rectangle.split.2x1") }.help("Side-by-Side View")
-                Button { showInfoPanel.toggle() } label: { Image(systemName: showInfoPanel ? "info.circle.fill" : "info.circle") }.help("Info Panel")
-                Button { showShortcuts.toggle() } label: { Image(systemName: "keyboard") }.popover(isPresented: $showShortcuts) { ShortcutGuideView(isPresented: $showShortcuts) }
-                Button { showSettings.toggle() } label: { Image(systemName: "gearshape") }
-                    .popover(isPresented: $showSettings) {
-                        SettingsView(showFileDetails: $showFileDetails, showCameraDetails: $showCameraDetails, showExposureDetails: $showExposureDetails, showAdvancedEXIF: $showAdvancedEXIF, showGPS: $showGPS)
+            VStack(spacing: 0) {
+                // Search bar
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search photos...", text: $filterText)
+                        .textFieldStyle(.roundedBorder)
+                    if !filterText.isEmpty {
+                        Button(action: { filterText = "" }) {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }
                     }
-                Button("Select Folder") { selectFolder() }.keyboardShortcut("o", modifiers: .command)
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                
+                Divider()
+                
+                // Main toolbar
+                HStack(spacing: 20) {
+                    Image(systemName: "photo").foregroundStyle(.secondary)
+                    Slider(value: $thumbnailSize, in: 100...800).frame(width: 150)
+                    Spacer()
+                    
+                    if !selectedPhotoIDs.isEmpty {
+                        Text("\(selectedPhotoIDs.count) Selected").foregroundStyle(.secondary)
+                        Button(role: .destructive) { deleteSelectedPhotos() } label: { Label("Trash", systemImage: "trash") }.keyboardShortcut(.delete, modifiers: [])
+                    }
+                    
+                    Divider().frame(height: 20)
+                    
+                    // RAW Organization Button
+                    HStack(spacing: 8) {
+                        if photoManager.hasRawOrganizationIssues {
+                            Button(action: { showOrganizeAlert = true }) {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .foregroundColor(.orange)
+                            }
+                            .help("RAW Organization Issues")
+                            .alert("Organization Issues", isPresented: $showOrganizeAlert) {
+                                Button("OK") { }
+                            } message: {
+                                Text(photoManager.rawOrganizationIssues.joined(separator: "\n"))
+                            }
+                        }
+                        
+                        Button(action: { photoManager.organizeRawFilesByExtension() }) {
+                            Label("Organize RAWs", systemImage: "folder.badge.gearshape")
+                        }
+                        .disabled(!photoManager.canOrganizeRaws || !photoManager.hasRawFiles)
+                        .help(photoManager.hasRawFiles ? "Organize RAW files into ARW/RAF folders" : "No RAW files to organize")
+                    }
+                    
+                    Divider().frame(height: 20)
+                    Button { isSplitView.toggle() } label: { Image(systemName: isSplitView ? "rectangle.split.2x1.fill" : "rectangle.split.2x1") }.help("Side-by-Side View")
+                    Button { showInfoPanel.toggle() } label: { Image(systemName: showInfoPanel ? "info.circle.fill" : "info.circle") }.help("Info Panel")
+                    Button { showShortcuts.toggle() } label: { Image(systemName: "keyboard") }.popover(isPresented: $showShortcuts) { ShortcutGuideView(isPresented: $showShortcuts) }
+                    Button { showSettings.toggle() } label: { Image(systemName: "gearshape") }
+                        .popover(isPresented: $showSettings) {
+                            SettingsView(showFileDetails: $showFileDetails, showCameraDetails: $showCameraDetails, showExposureDetails: $showExposureDetails, showAdvancedEXIF: $showAdvancedEXIF, showGPS: $showGPS)
+                        }
+                    Button("Select Folder") { selectFolder() }.keyboardShortcut("o", modifiers: .command)
+                }
+                .padding()
+                .background(Material.bar)
             }
-            .padding()
-            .background(Material.bar)
         }
         .frame(minWidth: 1000, minHeight: 700)
         
@@ -130,7 +228,7 @@ struct ContentView: View {
         
         // Keyboard Setup
         .focusable()
-        .onKeyPress(keys: [.leftArrow, .rightArrow, .escape, "x", "X", "k", "K", "u", "U"] as Set<KeyEquivalent>) { press in
+        .onKeyPress(keys: [.leftArrow, .rightArrow, .escape, "x", "X", "k", "K", "u", "U", "z", "Z"] as Set<KeyEquivalent>) { press in
             switch press.key {
             case .leftArrow: moveSelection(offset: -1, extending: press.modifiers.contains(.shift)); return .handled
             case .rightArrow: moveSelection(offset: 1, extending: press.modifiers.contains(.shift)); return .handled
@@ -138,8 +236,42 @@ struct ContentView: View {
             case "x", "X": photoManager.flagSelected(ids: selectedPhotoIDs, keep: false); return .handled
             case "k", "K": photoManager.flagSelected(ids: selectedPhotoIDs, keep: true); return .handled
             case "u", "U": photoManager.unflagSelected(ids: selectedPhotoIDs); return .handled
+            case "z", "Z": photoManager.toggleFlagSelected(ids: selectedPhotoIDs); return .handled
             default: return .ignored
             }
+        }
+    }
+    
+    func updateMarqueeSelection() {
+        guard let start = marqueeStart else { return }
+        let rect = CGRect(
+            x: min(start.x, marqueeEnd.x),
+            y: min(start.y, marqueeEnd.y),
+            width: abs(marqueeEnd.x - start.x),
+            height: abs(marqueeEnd.y - start.y)
+        )
+        
+        var newSelection: Set<UUID> = []
+        for (_, group) in filteredGroups.enumerated() {
+            // In a real implementation, would check if card frame intersects marquee rect
+            // For now, simplified to just show marquee visualization
+            if selectedPhotoIDs.contains(group.id) {
+                newSelection.insert(group.id)
+            }
+        }
+        if !newSelection.isEmpty {
+            selectedPhotoIDs = newSelection
+        }
+    }
+    
+    func initiateDrag(from groups: [PhotoGroup], at index: Int) {
+        let selectedGroups = groups.filter { selectedPhotoIDs.contains($0.id) }
+        let dragGroups = selectedGroups.isEmpty ? groups : selectedGroups
+        
+        // For now, basic drag. Real implementation would use AppKit NSDraggingSource
+        for group in dragGroups {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(group.rawPreferredURL.path, forType: .fileURL)
         }
     }
     
@@ -155,6 +287,15 @@ struct ContentView: View {
     
     func toggleSelection(for id: UUID, at index: Int) {
         if selectedPhotoIDs.contains(id) { selectedPhotoIDs.remove(id) } else { selectedPhotoIDs = [id] }
+        lastSelectedIndex = index
+    }
+    
+    func extendSelection(to id: UUID, at index: Int) {
+        let fromIndex = min(lastSelectedIndex, index)
+        let toIndex = max(lastSelectedIndex, index)
+        for i in fromIndex...toIndex {
+            selectedPhotoIDs.insert(photoManager.photoGroups[i].id)
+        }
         lastSelectedIndex = index
     }
     
@@ -177,6 +318,19 @@ struct ContentView: View {
             photoManager.scanDirectory(at: url)
             selectedPhotoIDs.removeAll(); lastSelectedIndex = 0
         }
+    }
+}
+
+// --- DRAG SOURCE COORDINATOR ---
+class FileDragSourceCoordinator: NSObject, NSDraggingSource {
+    var isDragging = false
+    
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        return .copy
+    }
+    
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        isDragging = false
     }
 }
 
@@ -230,13 +384,15 @@ struct LiveZoomableView: View {
                     Text(group.baseName).font(.system(size: 14, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Material.ultraThin).cornerRadius(8).shadow(radius: 2)
                     if group.isKept { Text("KEEP").font(.system(size: 12, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Color.green.opacity(0.8)).cornerRadius(8) }
                     if group.isRejected { Text("REJECT").font(.system(size: 12, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Color.red.opacity(0.8)).cornerRadius(8) }
+                    if let score = group.focusScore {
+                        Text("FOCUS: \(String(format: "%.1f", score * 100))").font(.system(size: 12, weight: .bold)).padding(.horizontal, 12).padding(.vertical, 8).background(Color.blue.opacity(0.8)).cornerRadius(8)
+                    }
                     Spacer()
                 }
                 .padding(.top, 24).padding(.leading, 24)
                 Spacer()
             }
         }
-        // DRAG FROM PREVIEW VIEW TOO
         .draggable(group.rawPreferredURL)
         .task(id: group.id) {
             highResImage = nil
@@ -291,9 +447,10 @@ struct InfoPanelView: View {
                         if showGPS { if let gps = meta["GPS"] { DetailRow(title: "GPS", value: gps) }; if let alt = meta["Altitude"] { DetailRow(title: "Altitude", value: alt) }; if meta["GPS"] != nil { Divider() } }
                         Text("Linked Files:").font(.caption).foregroundStyle(.secondary)
                         if group.arwURL != nil { Label("RAW (.ARW)", systemImage: "doc.text.image") }
-                        if group.rafURL != nil { Label("RAW (.RAF)", systemImage: "doc.text.image") } // FUJI IN INFO PANEL
+                        if group.rafURL != nil { Label("RAW (.RAF)", systemImage: "doc.text.image") }
                         if group.heifURL != nil { Label("HEIF", systemImage: "photo") }
                         if group.jpgURL != nil { Label("JPEG", systemImage: "photo") }
+                        if group.pngURL != nil { Label("PNG", systemImage: "photo") }
                     }
                 } else { Text("No photo selected.").foregroundStyle(.secondary) }
                 Spacer()
@@ -305,5 +462,69 @@ struct InfoPanelView: View {
 }
 
 struct DetailRow: View { let title: String; let value: String; var body: some View { VStack(alignment: .leading, spacing: 2) { Text(title).font(.caption).foregroundStyle(.secondary); Text(value).font(.body) } } }
-struct PhotoCardView: View { let group: PhotoGroup; let size: Double; var body: some View { VStack(spacing: 8) { if let cgImage = group.thumbnail { Image(decorative: cgImage, scale: 1.0).resizable().scaledToFit().frame(height: size * 0.75).cornerRadius(8) } else { Rectangle().fill(Color.gray.opacity(0.3)).frame(height: size * 0.75) }; HStack { Text(group.baseName).font(.caption).fontWeight(.bold).lineLimit(1); Spacer(); if group.isKept { Circle().fill(Color.green).frame(width: 10, height: 10) } else if group.isRejected { Circle().fill(Color.red).frame(width: 10, height: 10) } }.padding(.horizontal, 4) }.padding(0).background(Color.clear).frame(width: size) } }
-struct ShortcutGuideView: View { @Binding var isPresented: Bool; var body: some View { VStack(alignment: .leading, spacing: 12) { HStack { Text("Shortcuts").font(.headline); Spacer(); Button("Close") { isPresented = false }.keyboardShortcut(.cancelAction) }; Divider(); HStack { Text("Arrows").bold(); Spacer(); Text("Navigate") }; HStack { Text("Shift + Arrows").bold(); Spacer(); Text("Multi-Select") }; HStack { Text("X / K").bold(); Spacer(); Text("Reject / Keep") }; HStack { Text("ESC").bold(); Spacer(); Text("Deselect All") } }.padding().frame(width: 250) } }
+struct PhotoCardView: View { 
+    let group: PhotoGroup
+    let size: Double
+    
+    var body: some View {
+        VStack(spacing: 8) {
+            ZStack(alignment: .topTrailing) {
+                if let cgImage = group.thumbnail {
+                    Image(decorative: cgImage, scale: 1.0).resizable().scaledToFit().frame(height: size * 0.75).cornerRadius(8)
+                } else {
+                    Rectangle().fill(Color.gray.opacity(0.3)).frame(height: size * 0.75)
+                }
+                
+                if let score = group.focusScore {
+                    Text("📍 \(String(format: "%.0f", score * 100))")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(4)
+                        .background(Color.black.opacity(0.7))
+                        .foregroundColor(.white)
+                        .cornerRadius(4)
+                        .padding(4)
+                }
+            }
+            
+            HStack {
+                Text(group.baseName).font(.caption).fontWeight(.bold).lineLimit(1)
+                Spacer()
+                if group.isKept {
+                    Circle().fill(Color.green).frame(width: 10, height: 10)
+                } else if group.isRejected {
+                    Circle().fill(Color.red).frame(width: 10, height: 10)
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+        .padding(0)
+        .background(Color.clear)
+        .frame(width: size)
+    }
+}
+
+struct ShortcutGuideView: View {
+    @Binding var isPresented: Bool
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Shortcuts").font(.headline)
+                Spacer()
+                Button("Close") { isPresented = false }.keyboardShortcut(.cancelAction)
+            }
+            Divider()
+            HStack { Text("Arrows").bold(); Spacer(); Text("Navigate") }
+            HStack { Text("Shift + Arrows").bold(); Spacer(); Text("Multi-Select") }
+            HStack { Text("Cmd + Click").bold(); Spacer(); Text("Toggle Item") }
+            HStack { Text("Shift + Click").bold(); Spacer(); Text("Select Range") }
+            HStack { Text("X").bold(); Spacer(); Text("Reject") }
+            HStack { Text("K").bold(); Spacer(); Text("Keep") }
+            HStack { Text("U").bold(); Spacer(); Text("Unflag") }
+            HStack { Text("Z").bold(); Spacer(); Text("Toggle Flag") }
+            HStack { Text("ESC").bold(); Spacer(); Text("Deselect All") }
+        }
+        .padding()
+        .frame(width: 320)
+    }
+}
