@@ -25,6 +25,7 @@ struct ContentView: View {
     @State private var isDraggingCoordinator: FileDragSourceCoordinator?
     @State private var filterText: String = ""
     @State private var showOrganizeAlert = false
+    @State private var cardFrames: [UUID: CGRect] = [:]
     
     var gridColumns: [GridItem] {
         [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.5), spacing: 16)]
@@ -54,6 +55,11 @@ struct ContentView: View {
                                 ForEach(Array(filteredGroups.enumerated()), id: \.element.id) { index, group in
                                     PhotoCardView(group: group, size: thumbnailSize)
                                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selectedPhotoIDs.contains(group.id) ? Color.accentColor : Color.clear, lineWidth: 4))
+                                        .background(GeometryReader { geo in
+                                            Color.clear.onAppear {
+                                                cardFrames[group.id] = geo.frame(in: .global)
+                                            }
+                                        })
                                         .highPriorityGesture(TapGesture(count: 1).onEnded {
                                             let modifiers = NSApp.currentEvent?.modifierFlags ?? []
                                             if modifiers.contains(.command) {
@@ -79,23 +85,19 @@ struct ContentView: View {
                             .padding()
                         }
                         .contentShape(Rectangle())
-                        .simultaneousGesture(DragGesture(minimumDistance: 0)
+                        .onTapGesture {
+                            // Only deselect on tap - let card taps be handled by their own gestures first
+                            selectedPhotoIDs.removeAll()
+                        }
+                        .simultaneousGesture(DragGesture(minimumDistance: 8)
                             .onChanged { value in
-                                // For marquee: if drag distance > 8, it's a marquee drag
-                                if marqueeStart == nil && hypot(value.translation.width, value.translation.height) >= 8 {
+                                if marqueeStart == nil {
                                     marqueeStart = value.startLocation
                                 }
-                                if marqueeStart != nil {
-                                    marqueeEnd = value.location
-                                    updateMarqueeSelection()
-                                }
+                                marqueeEnd = value.location
+                                updateMarqueeSelection()
                             }
-                            .onEnded { value in
-                                // For deselect: only if drag distance < 4 (basically a click) in empty area
-                                let distance = hypot(value.translation.width, value.translation.height)
-                                if distance < 4 && marqueeStart == nil {
-                                    selectedPhotoIDs.removeAll()
-                                }
+                            .onEnded { _ in
                                 marqueeStart = nil
                             }
                         )
@@ -269,24 +271,21 @@ struct ContentView: View {
     
     func updateMarqueeSelection() {
         guard let start = marqueeStart else { return }
-        let rect = CGRect(
+        let marqueeRect = CGRect(
             x: min(start.x, marqueeEnd.x),
             y: min(start.y, marqueeEnd.y),
             width: abs(marqueeEnd.x - start.x),
             height: abs(marqueeEnd.y - start.y)
         )
         
+        // Select all cards whose frames intersect with the marquee rectangle
         var newSelection: Set<UUID> = []
-        for (_, group) in filteredGroups.enumerated() {
-            // In a real implementation, would check if card frame intersects marquee rect
-            // For now, simplified to just show marquee visualization
-            if selectedPhotoIDs.contains(group.id) {
+        for group in filteredGroups {
+            if let cardFrame = cardFrames[group.id], marqueeRect.intersects(cardFrame) {
                 newSelection.insert(group.id)
             }
         }
-        if !newSelection.isEmpty {
-            selectedPhotoIDs = newSelection
-        }
+        selectedPhotoIDs = newSelection
     }
     
     func initiateDrag(from groups: [PhotoGroup], at index: Int) {
@@ -453,10 +452,18 @@ struct InfoPanelView: View {
     var showFileDetails: Bool; var showCameraDetails: Bool; var showExposureDetails: Bool; var showAdvancedEXIF: Bool; var showGPS: Bool
     
     var body: some View {
-        ScrollView {
+        if selectedIDs.count > 1 {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Metadata").font(.title2).bold()
-                if selectedIDs.count > 1 { Text("\(selectedIDs.count) items selected") } else if let id = selectedIDs.first, let group = photoManager.photoGroups.first(where: { $0.id == id }) {
+                Text("\(selectedIDs.count) items selected").foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding()
+            .background(Color(NSColor.windowBackgroundColor))
+        } else if let id = selectedIDs.first, let group = photoManager.photoGroups.first(where: { $0.id == id }) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Metadata").font(.title2).bold()
                     let meta = photoManager.getMetadata(for: group)
                     VStack(alignment: .leading, spacing: 12) {
                         DetailRow(title: "Filename", value: group.baseName)
@@ -474,12 +481,24 @@ struct InfoPanelView: View {
                         if group.jpgURL != nil { Label("JPEG", systemImage: "photo") }
                         if group.pngURL != nil { Label("PNG", systemImage: "photo") }
                     }
-                } else { Text("No photo selected.").foregroundStyle(.secondary) }
+                    Spacer()
+                }
+                .padding()
+            }
+            .background(Color(NSColor.windowBackgroundColor))
+        } else {
+            VStack {
+                Spacer()
+                VStack(spacing: 12) {
+                    Image(systemName: "photo").font(.system(size: 32)).foregroundStyle(.secondary)
+                    Text("No Photo Selected").font(.headline).foregroundStyle(.secondary)
+                    Text("Select a photo to view metadata").font(.caption).foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
                 Spacer()
             }
-            .padding()
+            .background(Color(NSColor.windowBackgroundColor))
         }
-        .background(Color(NSColor.windowBackgroundColor))
     }
 }
 
