@@ -311,6 +311,25 @@ class FileDragSourceCoordinator: NSObject, NSDraggingSource {
     
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
         isDragging = false
+        
+        // ✨ FIX 1: Inject a synthetic "Mouse Up" event to un-stick SwiftUI
+        // This forces SwiftUI to reset its gesture state so marquee & clicks work again!
+        DispatchQueue.main.async {
+            guard let window = NSApp.keyWindow ?? NSApp.windows.first else { return }
+            if let mouseUp = NSEvent.mouseEvent(
+                with: .leftMouseUp,
+                location: window.mouseLocationOutsideOfEventStream,
+                modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber,
+                context: nil,
+                eventNumber: 0,
+                clickCount: 1,
+                pressure: 0
+            ) {
+                NSApp.postEvent(mouseUp, atStart: false)
+            }
+        }
     }
 }
 
@@ -527,9 +546,11 @@ struct PhotoGridView: View {
     let thumbnailSize: Double
     let photoManager: PhotoManager
     
+    // NEW: Coordinator to hold the native AppKit drag session state
+    @State private var dragCoordinator = FileDragSourceCoordinator()
+    
     var body: some View {
         ScrollView {
-            // FIX 1: ZStack placed inside the ScrollView so the overlay scrolls naturally
             ZStack(alignment: .topLeading) {
                 LazyVGrid(columns: gridColumns, spacing: 16) {
                     ForEach(Array(filteredGroups.enumerated()), id: \.element.id) { index, group in
@@ -570,37 +591,16 @@ struct PhotoGridView: View {
                                 }
                                 lastSelectedIndex = index
                             })
-                            .onDrag {
-                                let dragGroups: [PhotoGroup]
-                                
-                                // 1. Check if the dragged item is part of the current selection.
-                                if selectedPhotoIDs.contains(group.id) {
-                                    // Dragging an already selected item pulls the whole selection
-                                    dragGroups = photoManager.photoGroups.filter { selectedPhotoIDs.contains($0.id) }
-                                } else {
-                                    // Dragging an UNSELECTED item should immediately select it
-                                    dragGroups = [group]
-                                    DispatchQueue.main.async {
-                                        selectedPhotoIDs = [group.id]
+                            // ✨ THE FIX: Replaced .onDrag with a native AppKit Drag initiator
+                            .simultaneousGesture(
+                                DragGesture(minimumDistance: 5)
+                                    .onChanged { _ in
+                                        if !dragCoordinator.isDragging {
+                                            dragCoordinator.isDragging = true
+                                            startNativeDrag(for: group)
+                                        }
                                     }
-                                }
-                                
-                                // 2. Return the first item so SwiftUI can create the visual drag "ghost" under your cursor
-                                let provider = NSItemProvider(object: dragGroups.first!.rawPreferredURL as NSURL)
-                                
-                                // 3. ✨ THE MAGIC HACK: Hijack the dedicated macOS Drag Pasteboard
-                                // We wait 0.05 seconds so SwiftUI finishes creating the drag session,
-                                // then we overwrite the drag clipboard with ALL selected files.
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                    let dragPasteboard = NSPasteboard(name: .drag)
-                                    dragPasteboard.clearContents()
-                                    
-                                    let urls = dragGroups.map { $0.rawPreferredURL as NSURL }
-                                    dragPasteboard.writeObjects(urls)
-                                }
-                                
-                                return provider
-                            }
+                            )
                     }
                 }
                 .padding()
@@ -610,7 +610,6 @@ struct PhotoGridView: View {
                     selectedPhotoIDs.removeAll()
                 }
                 
-                // FIX 2: Marquee visual moved here
                 if let start = marqueeStart {
                     let rect = CGRect(
                         x: min(start.x, marqueeEnd.x),
@@ -631,14 +630,12 @@ struct PhotoGridView: View {
         .simultaneousGesture(DragGesture(minimumDistance: 8, coordinateSpace: .named("GridSpace"))
             .onChanged { value in
                 if marqueeStart == nil {
-                    // FIX 3: If the drag starts ON a photo, completely abort the marquee
-                    // This stops the marquee from resetting your selection during drag-and-drop
                     let isHit = cardFrames.values.contains { $0.contains(value.startLocation) }
                     if isHit { return }
                     marqueeStart = value.startLocation
                 }
                 
-                guard marqueeStart != nil else { return } // Keep skipping if we aborted
+                guard marqueeStart != nil else { return } 
                 marqueeEnd = value.location
                 updateMarqueeSelection()
             }
@@ -648,6 +645,69 @@ struct PhotoGridView: View {
         )
     }
     
+    // MARK: - Native Drag Logic
+    func startNativeDrag(for group: PhotoGroup) {
+        guard let event = NSApp.currentEvent,
+              let view = NSApp.keyWindow?.contentView else { return }
+        
+        let dragGroups: [PhotoGroup]
+        if selectedPhotoIDs.contains(group.id) {
+            dragGroups = photoManager.photoGroups.filter { selectedPhotoIDs.contains($0.id) }
+        } else {
+            dragGroups = [group]
+            DispatchQueue.main.async { selectedPhotoIDs = [group.id] }
+        }
+        
+        var draggingItems: [NSDraggingItem] = []
+        let location = view.convert(event.locationInWindow, from: nil)
+        
+        for (index, dragGroup) in dragGroups.enumerated() {
+            let url = dragGroup.rawPreferredURL as NSURL
+            let dragItem = NSDraggingItem(pasteboardWriter: url)
+            
+            let imageSize = CGSize(width: 100, height: 100)
+            let offset = CGFloat(min(index, 4) * 8) // Creates the stacked visual effect
+            
+            let frame = NSRect(
+                x: location.x - (imageSize.width / 2) + offset,
+                y: location.y - (imageSize.height / 2) - offset,
+                width: imageSize.width,
+                height: imageSize.height
+            )
+            
+            // Only render heavy thumbnails for the first 5 items to keep it lightning fast
+            if index < 5 {
+                let image = NSImage(size: imageSize)
+                image.lockFocus()
+                
+                // Draw thumbnail
+                if let cgImage = dragGroup.thumbnail {
+                    let nsImage = NSImage(cgImage: cgImage, size: imageSize)
+                    nsImage.draw(in: NSRect(origin: .zero, size: imageSize))
+                } else {
+                    let icon = NSWorkspace.shared.icon(forFile: url.path ?? "")
+                    icon.draw(in: NSRect(origin: .zero, size: imageSize))
+                }
+                
+                // ✨ FIX 2: Removed the manual Red Badge code block here.
+                // macOS will automatically draw a perfectly scaled red badge for us!
+                
+                image.unlockFocus()
+                dragItem.setDraggingFrame(frame, contents: image)
+            } else {
+                // Invisible items for the payload (still gets transferred to WhatsApp/Finder)
+                let emptyImage = NSImage(size: NSSize(width: 1, height: 1))
+                dragItem.setDraggingFrame(frame, contents: emptyImage)
+            }
+            
+            draggingItems.append(dragItem)
+        }
+        
+        // Launch the Native macOS Drag Session!
+        view.beginDraggingSession(with: draggingItems, event: event, source: dragCoordinator)
+    }
+    
+    // MARK: - Selection Logic
     func updateMarqueeSelection() {
         guard let start = marqueeStart else { return }
         let marqueeRect = CGRect(
