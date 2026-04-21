@@ -45,9 +45,22 @@ class PhotoManager {
     }
     
     nonisolated private func buildPhotoGroups(at folderURL: URL) async throws -> [PhotoGroup] {
-        let files = try FileManager.default.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)
-        
+        // Use recursive enumeration to scan subdirectories (ARW/, RAF/, etc.)
         let allowedExts = ["arw", "raf", "heif", "hif", "heic", "jpg", "jpeg", "png"]
+        var files: [URL] = []
+        
+        guard let enumerator = FileManager.default.enumerator(
+            at: folderURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return []
+        }
+        
+        for case let file as URL in enumerator where allowedExts.contains(file.pathExtension.lowercased()) {
+            files.append(file)
+        }
+        
         var groupedMap: [String: PhotoGroup] = [:]
         
         for fileURL in files {
