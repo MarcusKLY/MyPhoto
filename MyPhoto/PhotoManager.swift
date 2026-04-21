@@ -247,42 +247,60 @@ class PhotoManager {
     func organizeRawFilesByExtension() {
         guard !photoGroups.isEmpty else { return }
         let fileManager = FileManager.default
-        var movedCount = 0
         
-        for group in photoGroups {
-            for rawURL in [group.arwURL, group.rafURL].compactMap({ $0 }) {
-                let source = rawURL.standardizedFileURL
+        // Loop through by index so we can mutate the struct directly in memory
+        for i in 0..<photoGroups.count {
+            
+            // 1. Process ARW files
+            if let source = photoGroups[i].arwURL {
                 let ext = source.pathExtension.lowercased()
-                guard ["arw", "raf"].contains(ext) else { continue }
-                
-                let root = source.deletingLastPathComponent().deletingLastPathComponent()
+                let root = source.deletingLastPathComponent()
                 let folderName = ext.uppercased()
-                let targetDirectory = root.appendingPathComponent(folderName, isDirectory: true)
                 
-                do {
-                    try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true, attributes: nil)
-                } catch {
-                    print("Failed to create folder: \(error.localizedDescription)")
-                    continue
+                // Only move if it's not already in an "ARW" folder
+                if root.lastPathComponent.uppercased() != folderName {
+                    let targetDirectory = root.appendingPathComponent(folderName, isDirectory: true)
+                    try? fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true, attributes: nil)
+                    let destination = targetDirectory.appendingPathComponent(source.lastPathComponent)
+                    
+                    if destination.path != source.path {
+                        do {
+                            try fileManager.moveItem(at: source, to: destination)
+                            // ✨ THE FIX: Instantly update the URL in memory instead of rescanning
+                            photoGroups[i].arwURL = destination 
+                        } catch {
+                            print("ARW Move failed: \(error.localizedDescription)")
+                        }
+                    }
                 }
+            }
+            
+            // 2. Process RAF files (Fuji)
+            if let source = photoGroups[i].rafURL {
+                let ext = source.pathExtension.lowercased()
+                let root = source.deletingLastPathComponent()
+                let folderName = ext.uppercased()
                 
-                let destination = targetDirectory.appendingPathComponent(source.lastPathComponent)
-                guard destination.path != source.path else { continue }
-                
-                do {
-                    try fileManager.moveItem(at: source, to: destination)
-                    movedCount += 1
-                } catch {
-                    print("Failed to move file: \(error.localizedDescription)")
+                if root.lastPathComponent.uppercased() != folderName {
+                    let targetDirectory = root.appendingPathComponent(folderName, isDirectory: true)
+                    try? fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true, attributes: nil)
+                    let destination = targetDirectory.appendingPathComponent(source.lastPathComponent)
+                    
+                    if destination.path != source.path {
+                        do {
+                            try fileManager.moveItem(at: source, to: destination)
+                            // ✨ THE FIX: Instantly update the URL in memory instead of rescanning
+                            photoGroups[i].rafURL = destination 
+                        } catch {
+                            print("RAF Move failed: \(error.localizedDescription)")
+                        }
+                    }
                 }
             }
         }
         
-        if movedCount > 0 {
-            if let first = photoGroups.first, let url = first.arwURL?.deletingLastPathComponent().deletingLastPathComponent() {
-                scanDirectory(at: url)
-            }
-        }
+        // Note: We completely deleted the `scanDirectory` call here. 
+        // The organization is now instantaneous!
     }
     
     private func rawFilesOutsideExpectedFolders() -> [URL] {
